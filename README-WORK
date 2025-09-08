@@ -1,0 +1,558 @@
+# Blockchain Development Environment Setup
+
+Complete Docker-based blockchain development environment with Ethereum node, smart contract deployment, GraphQL indexing, and external access via Ngrok.
+
+## Architecture Overview
+
+```
+Internet → Ngrok → Caddy Reverse Proxy → Multiple Services
+                                     ├── Geth (Ethereum Node)
+                                     ├── Smart Contract Deployer
+                                     ├── Deployment Info Server
+                                     ├── Graph Stack (GraphQL)
+                                     └── Blockscout Explorer
+```
+
+## Phase 1: Core Infrastructure
+
+### Prerequisites
+- Docker Desktop with WSL integration enabled
+- Ngrok account with domain
+- Git repository
+
+### Services Implemented
+
+#### 1. Geth (Ethereum Node)
+- **Image**: `ethereum/client-go:v1.15.0`
+- **Mode**: Development mode (`--dev`)
+- **Ports**: 8545 (HTTP RPC), 8546 (WebSocket), 30303 (P2P)
+- **Features**: Auto-mining, CORS enabled, all APIs exposed
+
+#### 2. Geth Initialization
+- **Purpose**: Account prefunding and blockchain setup
+- **Script**: `geth-init/entrypoint.sh`
+- **Key Function**: Executes `prefund.js` to fund deployer account with 100 ETH
+- **Completion Signal**: Creates `/shared/geth-init-complete` file
+
+#### 3. Smart Contract Deployer
+- **Image**: `ghcr.io/foundry-rs/foundry:latest`
+- **Security**: Uses environment variables for private keys via `.env` file
+- **Process**: Clones assignment repository, deploys contracts, generates `deployment.json`
+- **Dependencies**: Waits for geth-init completion
+
+#### 4. Deployment Info Server
+- **Image**: `caddy:2.7-alpine`
+- **Purpose**: Serves deployment.json with proper JSON content-type
+- **Configuration**: Simple file server with CORS headers
+
+#### 5. Caddy Reverse Proxy
+- **Image**: `caddy:2.7-alpine`
+- **Port**: 8080
+- **Features**: CORS support, multiple route handling
+- **Routes**:
+  - `/` → Geth RPC
+  - `/rpc/*` → Geth RPC (with prefix stripping)
+  - `/deployment/*` → Deployment server
+  - `/graph-playground/*` → Graph Node (Phase 2)
+
+#### 6. Ngrok Tunneling
+- **Service**: External tunnel for internet access
+- **Domain**: Custom domain from Ngrok dashboard
+- **Target**: Port 8080 (Caddy)
+
+### Key Configuration Files
+
+#### Environment Variables (`.env`)
+```env
+PRIVATE_KEY=your_private_key_here
+DEPLOYER_ADDRESS=0x_my_wallet
+```
+
+#### Prefunding Script (`geth-init/prefund.js`)
+```javascript
+const from = eth.accounts[0];
+const contractDeployer = "0x_my_wallet";
+eth.sendTransaction({
+  from: from,
+  to: contractDeployer,
+  value: web3.toWei(100, "ether"),
+});
+```
+
+#### Caddy Configuration
+```caddyfile
+{
+    auto_https off
+}
+
+(cors) {
+    @cors_preflight* method OPTIONS
+    @cors* header Origin *
+    # ... CORS configuration
+}
+
+:80 {
+    import cors
+    handle /deployment* { reverse_proxy sc-deployment-server:80 }
+    handle /rpc* { 
+        uri strip_prefix /rpc
+        reverse_proxy geth:8545 
+    }
+    handle { reverse_proxy geth:8545 }
+}
+```
+
+### Phase 1 Troubleshooting
+
+#### Issue 1: Docker Image Access
+**Problem**: `unauthorized` error when pulling `ghcr.io/hell-month/foundry:latest`
+**Solution**: Changed to public image `ghcr.io/foundry-rs/foundry:latest`
+
+#### Issue 2: Ngrok Port Mismatch
+**Problem**: Ngrok connected to port 8545 (Geth direct) instead of 8080 (Caddy)
+**Symptom**: RPC worked but deployment.json inaccessible externally
+**Solution**: Corrected Ngrok to target port 8080
+
+#### Issue 3: Private Key Security
+**Problem**: Private key exposed in docker-compose.yml
+**Solution**: Moved to `.env` file with environment variable injection
+
+#### Issue 4: Caddy Routing Syntax
+**Problem**: Graph playground route outside `:80 {}` block
+**Solution**: Moved all handle blocks inside the port 80 configuration
+
+## Phase 2: Data Layer
+
+### Graph Stack Implementation
+
+#### Services Added
+1. **IPFS** (`ipfs/kubo:latest`) - Port 5001
+2. **PostgreSQL** (`postgres:14`) - Port 5432  
+3. **Redis** (`redis:7-alpine`) - Port 6379
+4. **Graph Node** (`graphprotocol/graph-node:latest`) - Ports 8000, 8020
+
+#### Graph Node Configuration
+```yaml
+environment:
+  postgres_host: graph-postgres
+  postgres_user: graph-node
+  postgres_pass: let-me-in
+  postgres_db: graph-node
+  ipfs: 'graph-ipfs:5001'
+  ethereum: 'local:http://geth:8545'
+```
+
+### Graph Stack Troubleshooting
+
+#### Issue 1: PostgreSQL Locale Error
+**Problem**: `database collation is en_US.utf8 but must be C`
+**Solution**: Added PostgreSQL initialization arguments:
+```yaml
+environment:
+  POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+```
+
+#### Issue 2: Database Encoding Conflict
+**Problem**: `database encoding is SQL_ASCII but must be UTF8`
+**Solution**: Removed conflicting locale environment variables, relied on INITDB_ARGS
+
+### Blockscout Explorer Implementation
+
+#### Approach Taken
+Used separate docker-compose.yml as per assignment requirements:
+```bash
+git clone https://github.com/blockscout/blockscout.git
+cd blockscout/docker-compose
+```
+
+#### Configuration Changes
+Modified `envs/common-blockscout.env`:
+```env
+ETHEREUM_JSONRPC_HTTP_URL=http://host.docker.internal:8545
+ETHEREUM_JSONRPC_TRACE_URL=http://host.docker.internal:8545
+ETHEREUM_JSONRPC_WS_URL=ws://host.docker.internal:8546
+CHAIN_ID=1337
+```
+
+### Blockscout Troubleshooting
+
+#### Issue 1: Port Conflicts
+**Problem**: Blockscout proxy attempted to use ports 8080 and 8081 (already in use)
+**Solution**: Modified `services/nginx.yml` to use ports 8082 and 8083
+
+#### Issue 2: Docker Credential Error
+**Problem**: `error getting credentials` when pulling Blockscout images
+**Solution**: Re-authenticated with Docker Hub (`docker login`)
+
+#### Issue 3: PostgreSQL Permission Errors (Ongoing)
+**Problem**: `could not change permissions of directory "/var/lib/postgresql/data": Operation not permitted`
+**Cause**: WSL file system permission limitations with Docker volumes
+**Attempted Solutions**:
+- Volume deletion and recreation
+- PostgreSQL configuration modifications
+- Alternative PostgreSQL initialization arguments
+
+**Current Status**: Unresolved due to WSL/Docker volume permission constraints
+
+## Final Endpoints
+
+Successfully implemented and accessible:
+
+### Local Access
+- Geth RPC: `http://localhost:8545`
+- Caddy Proxy: `http://localhost:8080`
+- Graph Playground: `http://localhost:8080/graph-playground/`
+- Deployment Info: `http://localhost:8080/deployment.json`
+
+### External Access (via Ngrok)
+- All services: `https://unreligious-oakley-unwhimperingly.ngrok-free.app/`
+- GraphQL API: `https://unreligious-oakley-unwhimperingly.ngrok-free.app/graph-playground/`
+- Deployment Info: `https://unreligious-oakley-unwhimperingly.ngrok-free.app/deployment.json`
+- RPC Endpoint: `https://unreligious-oakley-unwhimperingly.ngrok-free.app/rpc`
+
+## Testing Commands
+
+### Basic Functionality
+```bash
+# Check latest block
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+  https://your-domain.ngrok-free.app/
+
+# Check account balance  
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x_my_wallet","latest"],"id":1}' \
+  https://your-domain.ngrok-free.app/
+
+# Check deployment info
+curl https://your-domain.ngrok-free.app/deployment.json
+
+# Check GraphQL playground
+curl https://your-domain.ngrok-free.app/graph-playground/
+```
+
+## Startup Instructions
+
+### Environment Recovery
+```bash
+# Start main services
+docker compose up -d
+
+# Start Ngrok (separate terminal)
+ngrok http 8080 --domain=your-domain.ngrok-free.app
+
+# Verify all services
+docker compose ps
+```
+
+### Service Dependencies
+1. Geth must start first
+2. Geth-init runs prefunding after Geth is ready
+3. Smart contract deployer waits for geth-init completion
+4. Graph Stack services can start independently
+5. Caddy routes all traffic appropriately
+
+## Security Considerations
+
+- Private keys stored in `.env` file (gitignored)
+- CORS properly configured for development
+- No production-sensitive data exposed
+- Local development environment only
+
+## Known Limitations
+
+1. **Blockscout Explorer**: WSL permission issues prevent full deployment
+2. **Development Mode**: Not suitable for production use
+3. **Local Dependencies**: Requires specific WSL/Docker Desktop configuration
+4. **Volume Persistence**: Some services may require data recreation on restart
+
+## Alternative Solutions Implemented
+
+Due to Blockscout challenges, implemented simple HTML-based explorer as fallback:
+- Nginx-served static HTML with JavaScript RPC calls
+- Direct blockchain interaction via Web3 API calls
+- Responsive interface for basic blockchain exploration
+
+This provides the core functionality required while avoiding complex infrastructure issues.
+
+--------------------------------------------------------------------------------------------------------- Day2
+
+# Phases 2-4: Core Services, Data Layer & Networking Implementation
+
+## Phase 2: Core Services Construction ✅
+
+### Objectives
+- Set up smart contract deployer with ephemeral container
+- Build deployment information server
+- Implement automated MiniAMM contract deployment and address extraction
+
+### Implemented Services
+
+#### 1. Smart Contract Deployer (sc-deployer)
+- **Container**: `ghcr.io/foundry-rs/foundry:latest`
+- **Function**: Ephemeral container that deploys MiniAMM contracts and terminates
+- **Key Files**:
+  - `sc-deployer/entrypoint.sh`: Main deployment script
+  - `sc-deployer/extract-addresses.sh`: Contract address extraction script
+
+#### 2. Deployment Information Server (sc-deployment-server)
+- **Container**: `caddy:2.7-alpine`
+- **Port**: `8081`
+- **Function**: Serves deployed contract addresses as JSON
+- **Endpoint**: `http://localhost:8081/deployment.json`
+
+### Deployment Results
+
+Successfully deployed contracts:
+```json
+{
+    "timestamp": "2025-09-08T10:05:51+00:00",
+    "source_file": "./mock-erc20-mini-amm/broadcast/MiniAMM.s.sol/1337/run-latest.json",
+    "contracts": {
+        "mock_erc_0": "0x5394db4c952ad2a79bebd778a01b4fabe9b8739d",
+        "mock_erc_1": "0x42bbea17362dfce1386dbbac226d36354f2d5487",
+        "mini_amm": "0xbbf4df9707031e1020ba669cdb3448781e36eb92"
+    }
+}
+```
+
+### Major Troubleshooting
+
+#### 1. Git Ownership Issues
+**Problem**: `fatal: detected dubious ownership in repository` error in Docker container
+
+**Solution**: Added git configuration in entrypoint.sh
+```bash
+git config --global --add safe.directory '*'
+git config --global user.name "Docker Deployer"
+git config --global user.email "deployer@docker.local"
+```
+
+#### 2. Incorrect Contract Name
+**Problem**: Called `MiniAMMScript` but actual contract name was `MiniAMMDeployment`
+
+**Solution**: Fixed contract name in deployment command
+```bash
+forge script script/MiniAMM.s.sol:MiniAMMDeployment
+```
+
+#### 3. Wrong Repository Directory
+**Problem**: Tried to access `cohort-1-assignments-public` but actual directory was `mock-erc20-mini-amm`
+
+**Solution**: Updated clone and navigation paths
+```bash
+git clone https://github.com/renesuno/mock-erc20-mini-amm.git
+cd mock-erc20-mini-amm
+```
+
+#### 4. Node.js Environment Missing
+**Problem**: Foundry container lacks Node.js for `extract-addresses.js`
+
+**Solution**: Replaced JavaScript with Shell script
+```bash
+ADDRESSES=$(grep -o '"contractAddress":"0x[a-fA-F0-9]\{40\}"' "$BROADCAST_FILE")
+```
+
+#### 5. JSON Parsing Pattern Mismatch
+**Problem**: Actual Foundry broadcast file structure differed from expected pattern
+
+**Solution**: Analyzed actual broadcast file and created accurate extraction patterns
+```bash
+MOCK_ERC_0=$(grep -A 10 '"contractName": "MockERC20"' "$BROADCAST_FILE" | grep '"contractAddress":' | head -1 | sed 's/.*"contractAddress": "\([^"]*\)".*/\1/')
+```
+
+---
+
+## Phase 3: Data Layer Construction ✅
+
+### Objectives
+- Set up Blockscout explorer with EVM node connection
+- Configure Graph stack (IPFS, PostgreSQL, Redis, Graph Node)
+- Establish GraphQL playground
+
+### Implementation Results
+
+#### 1. Blockscout Explorer Setup
+- **Deployment**: Separate docker-compose stack as required
+- **Database**: PostgreSQL with WSL-compatible configuration
+- **Frontend**: Nginx proxy serving web interface
+- **Backend**: Connected to local Geth node via `host.docker.internal:8545`
+
+#### 2. Graph Stack Configuration
+- **IPFS Node**: `http://localhost:5001`
+- **PostgreSQL**: Graph data storage
+- **Redis**: Caching layer
+- **Graph Node**: GraphQL endpoint at `http://localhost:8000`
+
+### Major Troubleshooting
+
+#### 1. PostgreSQL Permission Issues in WSL
+**Problem**: 
+```
+chmod: changing permissions of '/var/lib/postgresql/data': Operation not permitted
+initdb: error: could not change permissions of directory "/var/lib/postgresql/data": Operation not permitted
+```
+
+**Solution**: Modified `db.yml` and `stats.yml` files
+- Removed `user: 2000:2000` setting
+- Changed from postgres:17 to postgres:14 (more stable)
+- Replaced `tmpfs` with Docker volumes
+- Updated authentication from `scram-sha-256` to `md5`
+
+#### 2. Network Isolation Between Docker Compose Stacks
+**Problem**: Blockscout running in separate docker-compose couldn't connect to main stack
+
+**Solution**: Connected networks manually
+```bash
+docker network connect 1b_geth-network proxy
+```
+
+#### 3. Blockscout Database Restart Loops
+**Problem**: Database containers continuously restarting due to permission errors
+
+**Solution**: WSL-compatible PostgreSQL configuration
+```yaml
+db:
+  image: postgres:14
+  environment:
+    POSTGRES_INITDB_ARGS: "--auth-host=md5 --auth-local=md5"
+  volumes:
+    - db-data:/var/lib/postgresql/data
+```
+
+### Verification Results
+- **Blockscout**: `http://localhost:80` - Web interface operational
+- **Graph Node**: `http://localhost:8000` - GraphQL endpoint responding
+- **Graph Status**: `http://localhost:8030` - OK status confirmed
+
+---
+
+## Phase 4: Networking & External Access ✅
+
+### Objectives
+- Configure reverse proxy routing for all services
+- Set up Ngrok tunneling for external access
+- Implement unified endpoint structure
+
+### Reverse Proxy Configuration
+
+#### Caddy Routing Setup
+All services accessible through single entry point:
+```
+:80 {
+    handle /graph-playground* {
+        uri strip_prefix /graph-playground
+        reverse_proxy graph-node:8000
+    }
+    handle /explorer* {
+        uri strip_prefix /explorer
+        reverse_proxy proxy:80
+    }
+    handle /deployment* {
+        reverse_proxy sc-deployment-server:80
+    }
+    handle /rpc* {
+        uri strip_prefix /rpc
+        reverse_proxy geth:8545
+    }
+}
+```
+
+### External Access Implementation
+
+#### Ngrok Configuration
+```yaml
+ngrok:
+  image: ngrok/ngrok:latest
+  container_name: ngrok
+  ports:
+    - "4040:4040"
+  environment:
+    NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+  command: http caddy:80
+  depends_on:
+    - caddy
+  networks:
+    - geth-network
+```
+
+### Major Troubleshooting
+
+#### 1. Ngrok Session Limits
+**Problem**: 
+```
+Your account is limited to 1 simultaneous ngrok agent sessions
+failed to start tunnel: Your account doesn't have permission to create labeled tunnels
+```
+
+**Solution**: Used simple tunnel command instead of labeled tunnels
+```yaml
+command: http caddy:80  # Instead of: tunnel --label edge=${NGROK_DOMAIN} http://caddy:80
+```
+
+#### 2. Caddy Configuration Errors
+**Problem**: Caddy container failing to start after configuration changes
+
+**Solution**: Incremental testing approach
+- Started with minimal configuration
+- Added routing rules one by one
+- Verified each endpoint before proceeding
+
+#### 3. Cross-Network Service Communication
+**Problem**: Services in different docker-compose stacks couldn't communicate
+
+**Solution**: Network bridging and host-based routing
+```bash
+docker network connect 1b_geth-network proxy
+```
+
+### Final External Endpoints
+
+**Public URL**: `https://1138f52d92e5.ngrok-free.app`
+
+Accessible endpoints:
+- **Smart Contracts Deployment**: `https://1138f52d92e5.ngrok-free.app/deployment`
+- **Blockchain Explorer**: `https://1138f52d92e5.ngrok-free.app/explorer`
+- **EVM Node RPC**: `https://1138f52d92e5.ngrok-free.app/rpc`
+- **Graph Playground**: `https://1138f52d92e5.ngrok-free.app/graph-playground`
+
+### Verification Commands
+
+```bash
+# Test all endpoints
+curl https://1138f52d92e5.ngrok-free.app/deployment
+curl https://1138f52d92e5.ngrok-free.app/graph-playground
+curl -X POST https://1138f52d92e5.ngrok-free.app/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+```
+
+---
+
+## Project Completion Status
+
+### Successfully Implemented
+- ✅ Automated MiniAMM contract deployment with address extraction
+- ✅ Blockchain explorer (Blockscout) with full transaction visibility
+- ✅ Graph Node with GraphQL playground for data querying
+- ✅ Unified reverse proxy routing through Caddy
+- ✅ External access via Ngrok tunneling
+- ✅ Complete Docker orchestration with proper networking
+
+### Architecture Overview
+```
+Internet → Ngrok Tunnel → Caddy Reverse Proxy → Individual Services
+                                              ├── Geth (EVM Node)
+                                              ├── Blockscout (Explorer)
+                                              ├── Graph Node (GraphQL)
+                                              └── Deployment Server (Contract Info)
+```
+
+### Key Learnings
+1. **WSL Compatibility**: Standard PostgreSQL Docker configurations require modification for WSL environments
+2. **Multi-Stack Networking**: Services in separate docker-compose files need explicit network bridging
+3. **Ngrok Free Limitations**: Account limitations require careful tunnel configuration
+4. **Container Orchestration**: Proper dependency management crucial for startup sequence
+5. **Error Handling**: Incremental testing approach prevents complex debugging scenarios
+
+All project requirements successfully met with external accessibility for instructor verification.
